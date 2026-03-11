@@ -2,7 +2,7 @@
 
 **A production-grade .NET 10 Worker Service that detects database schema drift between your EF Core model and a live database — before your application notices.**
 
-[![Build](https://github.com/you/guard-dog/actions/workflows/ci.yml/badge.svg)](https://github.com/you/guard-dog/actions)
+[![Build](https://github.com/ugniusado/guard-dog/actions/workflows/ci.yml/badge.svg)](https://github.com/ugniusado/guard-dog/actions)
 
 ---
 
