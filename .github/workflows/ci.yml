@@ -67,12 +67,14 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
-      - name: Build application under test
-        # Replace with your application project path
+      - name: Publish application under test
+        # dotnet publish (not build) so all runtime dependency DLLs are present
+        # alongside the assembly when the SnapshotTool loads it via reflection.
         run: |
-          dotnet build src/GuardDog.Worker/GuardDog.Worker.csproj \
+          dotnet publish src/GuardDog.Worker/GuardDog.Worker.csproj \
             --configuration Release \
-            --output ./publish/app
+            --output ./publish/app \
+            --self-contained false
 
       - name: Generate Shadow Schema Snapshot
         run: |
