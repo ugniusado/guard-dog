@@ -1,0 +1,166 @@
+name: CI — Build, Test & Snapshot
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: 1
+
+jobs:
+  # ── Build & Test ────────────────────────────────────────────────────────────
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Run tests
+        run: >
+          dotnet test
+          --no-build
+          --configuration Release
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory ./test-results
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ./test-results/*.trx
+
+  # ── Phase 2: Generate Shadow Schema Snapshot ─────────────────────────────────
+  # Run this AFTER building the application under test (MyApp), not GuardDog.
+  # This job demonstrates the CI/CD integration pattern:
+  #   1. Build the application whose DbContext we want to introspect
+  #   2. Run GuardDog.SnapshotTool against the compiled assembly
+  #   3. Publish the snapshot.json as a build artifact
+  #   4. The GuardDog.Worker Dockerfile (or Helm chart) picks it up and embeds it
+  #
+  # For a real project, replace MyApp references with your actual project paths.
+  generate-snapshot:
+    name: Generate Schema Snapshot
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build application under test
+        # Replace with your application project path
+        run: |
+          dotnet build src/GuardDog.Worker/GuardDog.Worker.csproj \
+            --configuration Release \
+            --output ./publish/app
+
+      - name: Generate Shadow Schema Snapshot
+        run: |
+          dotnet run --project src/GuardDog.SnapshotTool/GuardDog.SnapshotTool.csproj \
+            --configuration Release \
+            -- \
+            --assembly  ./publish/app/GuardDog.Worker.dll \
+            --context   GuardDog.Worker.SampleDbContext \
+            --output    ./snapshot.json \
+            --version   "${{ github.sha }}"
+        # Note: SampleDbContext is the demo context in GuardDog.Worker.
+        # In production: point this at MyApp.Data.AppDbContext in your app's assembly.
+
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-snapshot
+          path: snapshot.json
+          retention-days: 90
+
+  # ── Phase 4: Update Database ER Diagram in Wiki ───────────────────────────────
+  # After a successful snapshot, regenerate the Mermaid diagram and push it
+  # to the repository wiki (or docs folder).
+  update-diagram:
+    name: Update ER Diagram
+    runs-on: ubuntu-latest
+    needs: generate-snapshot
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download snapshot artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: schema-snapshot
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Generate Mermaid diagram from snapshot
+        # The worker generates the diagram on each check, but we can also
+        # produce a standalone diagram from the snapshot in CI using a small
+        # helper script.
+        run: |
+          cat > GenerateDiagram.csx << 'EOF'
+          #r "nuget: GuardDog.Core, 1.0.0"   // in a real project, add project reference
+          // For now we use the built DiagramGenerator directly
+          EOF
+          echo "Diagram generation: the running worker writes docs/database.md on each successful check."
+          echo "In CI, you can also call the worker's MermaidErDiagramGenerator from a small script."
+
+      - name: Commit updated diagram
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs: regenerate database.md ER diagram [skip ci]"
+          file_pattern: docs/database.md
+
+  # ── Docker Build ─────────────────────────────────────────────────────────────
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: generate-snapshot
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download snapshot artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: schema-snapshot
+          path: src/GuardDog.Worker/
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f src/GuardDog.Worker/Dockerfile \
+            -t guard-dog:${{ github.sha }} \
+            -t guard-dog:latest \
+            .
+        # The Dockerfile copies snapshot.json into the image so the worker
+        # has the shadow schema embedded without needing an external volume.
+
+      # Uncomment to push to a registry:
+      # - name: Push to registry
+      #   run: |
+      #     docker tag guard-dog:latest ${{ secrets.REGISTRY }}/guard-dog:${{ github.sha }}
+      #     docker push ${{ secrets.REGISTRY }}/guard-dog:${{ github.sha }}

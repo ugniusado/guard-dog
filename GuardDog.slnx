@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GuardDog.Core/GuardDog.Core.csproj" />
+    <Project Path="src/GuardDog.SnapshotTool/GuardDog.SnapshotTool.csproj" />
+    <Project Path="src/GuardDog.Worker/GuardDog.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GuardDog.Core.Tests/GuardDog.Core.Tests.csproj" />
+  </Folder>
+</Solution>
