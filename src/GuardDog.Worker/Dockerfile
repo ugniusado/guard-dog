@@ -3,7 +3,8 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 # Copy solution and project files first for layer caching
-COPY GuardDog.sln .
+# .NET 10 uses .slnx (XML solution format) instead of .sln
+COPY GuardDog.slnx .
 COPY src/GuardDog.Core/GuardDog.Core.csproj           src/GuardDog.Core/
 COPY src/GuardDog.Worker/GuardDog.Worker.csproj        src/GuardDog.Worker/
 COPY src/GuardDog.SnapshotTool/GuardDog.SnapshotTool.csproj src/GuardDog.SnapshotTool/
