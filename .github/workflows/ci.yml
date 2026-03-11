@@ -67,9 +67,7 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
-      - name: Publish application under test
-        # dotnet publish (not build) so all runtime dependency DLLs are present
-        # alongside the assembly when the SnapshotTool loads it via reflection.
+      - name: Publish Worker
         run: |
           dotnet publish src/GuardDog.Worker/GuardDog.Worker.csproj \
             --configuration Release \
@@ -77,16 +75,17 @@ jobs:
             --self-contained false
 
       - name: Generate Shadow Schema Snapshot
+        # The Worker binary has a --generate-snapshot mode that instantiates
+        # SampleDbContext directly and runs EfCoreSnapshotGenerator. Because it
+        # executes under its own runtimeconfig, every dependency resolves without
+        # any reflection or AssemblyLoadContext workarounds.
+        #
+        # In your own project: add the same --generate-snapshot handler to your
+        # application's Program.cs and point it at your real DbContext.
         run: |
-          dotnet run --project src/GuardDog.SnapshotTool/GuardDog.SnapshotTool.csproj \
-            --configuration Release \
-            -- \
-            --assembly  ./publish/app/GuardDog.Worker.dll \
-            --context   GuardDog.Worker.SampleDbContext \
-            --output    ./snapshot.json \
-            --version   "${{ github.sha }}"
-        # Note: SampleDbContext is the demo context in GuardDog.Worker.
-        # In production: point this at MyApp.Data.AppDbContext in your app's assembly.
+          dotnet ./publish/app/GuardDog.Worker.dll \
+            --generate-snapshot ./snapshot.json \
+            --snapshot-version  "${{ github.sha }}"
 
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@v4

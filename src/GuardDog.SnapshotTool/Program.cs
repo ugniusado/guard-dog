@@ -3,38 +3,32 @@
  *
  * PURPOSE
  * -------
- * This CLI tool is run during your CI/CD pipeline immediately after the build step.
- * It loads a DbContext from a compiled assembly, calls EfCoreSnapshotGenerator to
- * introspect the EF Core model, and writes a schema snapshot JSON file.
- *
- * That snapshot is then embedded into GuardDog.Worker as a build artifact so the
- * worker can compare the expected DB schema (at deploy time) against the live DB
- * without needing the application source code at runtime.
+ * This CLI tool is run during your CI/CD pipeline immediately after the publish step.
+ * It loads a DbContext from a published assembly using a proper AssemblyLoadContext
+ * (so all transitive dependencies resolve via the .deps.json file), calls
+ * EfCoreSnapshotGenerator to introspect the EF Core model, and writes a snapshot JSON.
  *
  * USAGE
  * -----
  *   dotnet run --project src/GuardDog.SnapshotTool -- \
- *       --assembly    ./MyApp/bin/Release/net10.0/MyApp.dll \
+ *       --assembly    ./publish/app/MyApp.dll \
  *       --context     MyApp.Data.AppDbContext \
  *       --output      ./snapshot.json \
  *       --version     ${{ github.sha }}
  *
- * ARGUMENTS
- * ---------
- *   --assembly  Path to the compiled application assembly containing the DbContext.
- *   --context   Fully qualified name of the DbContext type to introspect.
- *   --output    Path for the generated snapshot.json file (default: snapshot.json).
- *   --version   Snapshot version string (default: 1.0.0; use git SHA in CI).
- *   --provider  EF provider name used for default schema inference
- *               (SqlServer | PostgreSQL; default: SqlServer).
+ * KEY DESIGN: AssemblyLoadContext + AssemblyDependencyResolver
+ * ------------------------------------------------------------
+ * Assembly.LoadFrom() uses the DEFAULT load context, which only looks in the
+ * current directory and GAC — it cannot find the target app's transitive
+ * dependencies (e.g. Microsoft.Extensions.Hosting.Abstractions).
  *
- * SECURITY NOTE
- * -------------
- * The snapshot tool only reads the EF model metadata — it does NOT connect to
- * any database.  It is safe to run in CI without DB credentials.
+ * AssemblyDependencyResolver reads the <assembly>.deps.json produced by
+ * `dotnet publish`, giving it the full dependency graph. Paired with a custom
+ * AssemblyLoadContext, this resolves every dependency from the publish folder.
  */
 
 using System.Reflection;
+using System.Runtime.Loader;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using GuardDog.Core.Models;
@@ -43,13 +37,12 @@ using Microsoft.EntityFrameworkCore;
 
 // ── Parse arguments ───────────────────────────────────────────────────────────
 
-var args_map = ParseArgs(args);
+var argsMap = ParseArgs(args);
 
-var assemblyPath = GetArg("--assembly");
+var assemblyPath    = GetArg("--assembly");
 var contextTypeName = GetArg("--context");
-var outputPath = GetArg("--output", "snapshot.json");
-var version = GetArg("--version", "1.0.0");
-var provider = GetArg("--provider", "SqlServer");
+var outputPath      = GetArg("--output",  "snapshot.json");
+var version         = GetArg("--version", "1.0.0");
 
 Console.WriteLine("Guard Dog Snapshot Tool");
 Console.WriteLine("=======================");
@@ -59,28 +52,30 @@ Console.WriteLine($"Output   : {outputPath}");
 Console.WriteLine($"Version  : {version}");
 Console.WriteLine();
 
-// ── Load the DbContext ────────────────────────────────────────────────────────
+// ── Load the DbContext via a proper AssemblyLoadContext ───────────────────────
 
 DbContext context;
 try
 {
-    var assembly   = Assembly.LoadFrom(Path.GetFullPath(assemblyPath));
+    var fullPath   = Path.GetFullPath(assemblyPath);
+    var loadContext = new TargetAssemblyLoadContext(fullPath);
+    var assembly   = loadContext.LoadFromAssemblyPath(fullPath);
+
     var contextType = assembly.GetType(contextTypeName)
         ?? throw new InvalidOperationException(
-            $"Type '{contextTypeName}' not found in assembly '{assemblyPath}'. " +
-            $"Available DbContext types:\n  " +
+            $"Type '{contextTypeName}' not found in '{assemblyPath}'.\n" +
+            "Available DbContext types:\n  " +
             string.Join("\n  ", assembly.GetTypes()
-                .Where(t => t.IsAssignableTo(typeof(DbContext)) && !t.IsAbstract)
+                .Where(t => typeof(DbContext).IsAssignableFrom(t) && !t.IsAbstract)
                 .Select(t => t.FullName)));
 
-    // Create a design-time instance using the parameterless ctor or
-    // IDesignTimeDbContextFactory<T> if present — for snapshot generation we
-    // only need the Model, so an in-memory provider suffices.
     context = CreateContext(contextType);
 }
 catch (Exception ex)
 {
     Console.Error.WriteLine($"ERROR loading DbContext: {ex.Message}");
+    if (ex.InnerException is not null)
+        Console.Error.WriteLine($"  Inner: {ex.InnerException.Message}");
     return 1;
 }
 
@@ -108,9 +103,9 @@ try
 
     var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions
     {
-        WriteIndented       = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        WriteIndented            = true,
+        DefaultIgnoreCondition   = JsonIgnoreCondition.WhenWritingNull,
+        PropertyNamingPolicy     = JsonNamingPolicy.CamelCase
     });
 
     await File.WriteAllTextAsync(outputPath, json);
@@ -123,16 +118,13 @@ catch (Exception ex)
 
 // ── Summary ───────────────────────────────────────────────────────────────────
 
-Console.WriteLine($"Snapshot generated successfully.");
+Console.WriteLine("Snapshot generated successfully.");
 Console.WriteLine($"  Tables    : {snapshot.Tables.Count}");
 Console.WriteLine($"  Columns   : {snapshot.Tables.Sum(t => t.Columns.Count)}");
 Console.WriteLine($"  Indexes   : {snapshot.Tables.Sum(t => t.Indexes.Count)}");
 Console.WriteLine($"  FKs       : {snapshot.Tables.Sum(t => t.ForeignKeys.Count)}");
 Console.WriteLine($"  ModelHash : {snapshot.ModelHash}");
 Console.WriteLine($"  Output    : {Path.GetFullPath(outputPath)}");
-Console.WriteLine();
-Console.WriteLine("Next step: embed snapshot.json into GuardDog.Worker as an EmbeddedResource,");
-Console.WriteLine("or mount it as a ConfigMap/volume in your deployment.");
 
 return 0;
 
@@ -149,16 +141,16 @@ static DbContext CreateContext(Type contextType)
 
     if (factoryType is not null)
     {
-        var factory = Activator.CreateInstance(factoryType)!;
+        var factory      = Activator.CreateInstance(factoryType)!;
         var createMethod = factoryType.GetMethod("CreateDbContext")!;
         return (DbContext)createMethod.Invoke(factory, [Array.Empty<string>()])!;
     }
 
-    // 2. Fall back to DbContextOptionsBuilder with InMemory provider
+    // 2. Fall back: DbContextOptionsBuilder with InMemory provider
+    //    We only need the EF Model metadata — no real DB connection required.
     var optionsBuilderType = typeof(DbContextOptionsBuilder<>).MakeGenericType(contextType);
     var optionsBuilder     = (DbContextOptionsBuilder)Activator.CreateInstance(optionsBuilderType)!;
 
-    // Use InMemory so we get the EF model without a real DB connection
     Microsoft.EntityFrameworkCore.InMemoryDbContextOptionsExtensions
         .UseInMemoryDatabase(optionsBuilder, "SnapshotToolDesignTime");
 
@@ -170,18 +162,18 @@ static DbContext CreateContext(Type contextType)
         : (DbContext)Activator.CreateInstance(contextType)!;
 }
 
-static Dictionary<string, string> ParseArgs(string[] args)
+static Dictionary<string, string> ParseArgs(string[] rawArgs)
 {
     var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-    for (int i = 0; i < args.Length - 1; i++)
-        if (args[i].StartsWith("--"))
-            map[args[i]] = args[i + 1];
+    for (int i = 0; i < rawArgs.Length - 1; i++)
+        if (rawArgs[i].StartsWith("--"))
+            map[rawArgs[i]] = rawArgs[i + 1];
     return map;
 }
 
 string GetArg(string name, string? defaultValue = null)
 {
-    if (args_map.TryGetValue(name, out var val) && !string.IsNullOrWhiteSpace(val))
+    if (argsMap.TryGetValue(name, out var val) && !string.IsNullOrWhiteSpace(val))
         return val;
     if (defaultValue is not null)
         return defaultValue;
@@ -189,4 +181,41 @@ string GetArg(string name, string? defaultValue = null)
     Console.Error.WriteLine($"ERROR: Required argument '{name}' is missing.");
     Environment.Exit(1);
     return null!;
+}
+
+// ── Custom AssemblyLoadContext ─────────────────────────────────────────────────
+
+/// <summary>
+/// Loads an assembly and resolves all its dependencies using the
+/// <see cref="AssemblyDependencyResolver"/>, which reads the
+/// <c>&lt;assembly&gt;.deps.json</c> produced by <c>dotnet publish</c>.
+///
+/// This is the correct way to load "foreign" assemblies at runtime in .NET —
+/// <c>Assembly.LoadFrom()</c> uses the default load context and cannot resolve
+/// transitive dependencies that live in the target's publish folder.
+/// </summary>
+sealed class TargetAssemblyLoadContext : AssemblyLoadContext
+{
+    private readonly AssemblyDependencyResolver _resolver;
+
+    public TargetAssemblyLoadContext(string assemblyPath)
+        : base(name: "GuardDogTarget", isCollectible: true)
+    {
+        _resolver = new AssemblyDependencyResolver(assemblyPath);
+    }
+
+    protected override Assembly? Load(AssemblyName assemblyName)
+    {
+        // Ask the resolver where this dependency lives in the publish folder.
+        // If it can't find it, return null → fallback to the default context
+        // (handles shared framework assemblies like System.Runtime).
+        var path = _resolver.ResolveAssemblyToPath(assemblyName);
+        return path is not null ? LoadFromAssemblyPath(path) : null;
+    }
+
+    protected override IntPtr LoadUnmanagedDll(string unmanagedDllName)
+    {
+        var path = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
+        return path is not null ? LoadUnmanagedDllFromPath(path) : IntPtr.Zero;
+    }
 }
