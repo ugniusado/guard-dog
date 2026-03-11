@@ -24,7 +24,7 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 
 # Phase 5 Security: Run as a non-root user
-RUN addgroup --system guarddog && adduser --system --ingroup guarddog guarddog
+RUN groupadd --system guarddog && useradd --no-create-home --system --gid guarddog guarddog
 USER guarddog
 
 COPY --from=build /app/publish .
